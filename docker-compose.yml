@@ -1,0 +1,17 @@
+services:
+  bot:
+    build: .
+    container_name: mgkap_schedule_bot
+    env_file: .env
+    volumes:
+      - ./bot.db:/app/bot.db
+      - ./schedules:/app/schedules
+    ports:
+      - "127.0.0.1:8081:8081"
+    networks:
+      - schedule-bot
+    restart: unless-stopped
+
+networks:
+  schedule-bot:
+    name: mgkap-schedule
