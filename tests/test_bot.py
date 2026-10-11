@@ -36,6 +36,38 @@ class RepositoryTests(unittest.TestCase):
             repository.migrate_legacy(str(legacy_path))
             self.assertEqual(repository.stats()["total"], 2)
 
+    def test_legacy_import_can_keep_users_without_role_as_applicants(self):
+        with tempfile.TemporaryDirectory() as directory:
+            legacy_path = Path(directory) / "legacy.db"
+            with sqlite3.connect(legacy_path) as db:
+                db.execute("CREATE TABLE users(user_id INTEGER PRIMARY KEY, username TEXT, role TEXT)")
+                db.executemany("INSERT INTO users VALUES(?,?,?)", [(1, "one", "student"), (2, "two", None)])
+            repository = bot.Repository(Path(directory) / "bot.db")
+            repository.migrate_legacy(str(legacy_path), default_role="applicant")
+            self.assertEqual(repository.stats(), {"student": 1, "teacher": 0, "applicant": 1, "total": 2})
+
+    def test_completed_broadcast_history_is_pruned_after_retention_period(self):
+        with tempfile.TemporaryDirectory() as directory:
+            repository = bot.Repository(Path(directory) / "bot.db")
+            with repository.connect() as db:
+                db.execute(
+                    "INSERT INTO broadcast_jobs(audience,kind,created_at,completed_at) VALUES(?,?,?,?)",
+                    ("student", "pdf", "2020-01-01T00:00:00+00:00", "2020-01-01T00:00:00+00:00"),
+                )
+                db.execute("INSERT INTO broadcast_deliveries(job_id,telegram_id,status) VALUES(1,1,'delivered')")
+            self.assertEqual(repository.cleanup_completed_broadcasts(7), 1)
+            with repository.connect() as db:
+                self.assertEqual(db.execute("SELECT COUNT(*) FROM broadcast_jobs").fetchone()[0], 0)
+                self.assertEqual(db.execute("SELECT COUNT(*) FROM broadcast_deliveries").fetchone()[0], 0)
+
+    def test_subscriber_can_be_found_and_removed(self):
+        with tempfile.TemporaryDirectory() as directory:
+            repository = bot.Repository(Path(directory) / "bot.db")
+            repository.set_role(SimpleNamespace(id=42, username="user", full_name="User"), "student")
+            self.assertEqual(repository.subscriber(42)["role"], "student")
+            self.assertTrue(repository.remove(42))
+            self.assertIsNone(repository.subscriber(42))
+
 
 class BroadcastTests(unittest.IsolatedAsyncioTestCase):
     async def test_queue_targets_only_selected_role_and_reuses_file_id(self):

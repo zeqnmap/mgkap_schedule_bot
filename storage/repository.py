@@ -75,9 +75,11 @@ class Repository:
                 if name not in columns:
                     db.execute(f"ALTER TABLE subscribers ADD COLUMN {name} {definition}")
 
-    def migrate_legacy(self, path: str) -> int:
+    def migrate_legacy(self, path: str, default_role: str = "") -> int:
         if not path or not Path(path).is_file() or Path(path).resolve() == self.path.resolve():
             return 0
+        if default_role not in ROLES:
+            default_role = ""
         legacy = sqlite3.connect(path)
         try:
             columns = {row[1] for row in legacy.execute("PRAGMA table_info(users)")}
@@ -88,11 +90,34 @@ class Repository:
             rows = legacy.execute(f"SELECT user_id,{username},{role} FROM users").fetchall()
             with self.connect() as db:
                 for uid, name, selected_role in rows:
-                    if selected_role in ROLES:
-                        db.execute("INSERT OR IGNORE INTO subscribers VALUES(?,?,?,?,?,?)", (uid, selected_role, name, name or "", now(), now()))
-            return sum(selected_role in ROLES for _, _, selected_role in rows)
+                    target_role = selected_role if selected_role in ROLES else default_role
+                    if target_role:
+                        db.execute("INSERT OR IGNORE INTO subscribers VALUES(?,?,?,?,?,?)", (uid, target_role, name, name or "", now(), now()))
+            return sum(selected_role in ROLES or bool(default_role) for _, _, selected_role in rows)
         finally:
             legacy.close()
+
+    def cleanup_completed_broadcasts(self, retention_days: int) -> int:
+        """Delete only finished delivery history older than the retention period."""
+        cutoff = datetime.now(timezone.utc).timestamp() - retention_days * 86400
+        with self.connect() as db:
+            completed = db.execute(
+                "SELECT id, completed_at FROM broadcast_jobs WHERE completed_at IS NOT NULL"
+            ).fetchall()
+            expired_ids = [
+                int(row["id"])
+                for row in completed
+                if datetime.fromisoformat(row["completed_at"]).timestamp() < cutoff
+            ]
+            if not expired_ids:
+                return 0
+            placeholders = ",".join("?" for _ in expired_ids)
+            db.execute(f"DELETE FROM broadcast_deliveries WHERE job_id IN ({placeholders})", expired_ids)
+            db.execute(f"DELETE FROM broadcast_jobs WHERE id IN ({placeholders})", expired_ids)
+            # SQLite reuses deleted pages internally; VACUUM returns them to the file system.
+            db.commit()
+            db.execute("VACUUM")
+            return len(expired_ids)
 
     def set_role(self, user: Any, role: str) -> None:
         with self.connect() as db:
@@ -104,6 +129,10 @@ class Repository:
     def remove(self, uid: int) -> bool:
         with self.connect() as db:
             return db.execute("DELETE FROM subscribers WHERE telegram_id=?", (uid,)).rowcount > 0
+
+    def subscriber(self, uid: int) -> sqlite3.Row | None:
+        with self.connect() as db:
+            return db.execute("SELECT * FROM subscribers WHERE telegram_id=?", (uid,)).fetchone()
 
     def recipients(self, audience: str) -> list[int]:
         with self.connect() as db:

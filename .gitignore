@@ -1,6 +1,13 @@
 .env
 bot.db
 bot.db.*
+bot.migrated.db
+bot.test.db
+bot.full.db
 bot-before-*.db
+ripo-users.db
 schedules/
 __pycache__/
+.venv/
+.idea/
+backups/
