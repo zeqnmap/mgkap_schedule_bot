@@ -16,6 +16,7 @@ def is_admin(uid: int | None) -> bool:
 def admin_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="📊 Статистика", callback_data="admin:stats"), InlineKeyboardButton(text="👥 Пользователи", callback_data="admin:users")],
+        [InlineKeyboardButton(text="🎓 Актуальные группы", callback_data="admin:groups")],
         [InlineKeyboardButton(text="📣 Рассылка", callback_data="admin:broadcast")],
         [InlineKeyboardButton(text="🗑 Удалить пользователя", callback_data="admin:delete"), InlineKeyboardButton(text="📄 Последние PDF", callback_data="admin:latest")],
         [InlineKeyboardButton(text="❌ Закрыть", callback_data="admin:close")],
@@ -23,6 +24,15 @@ def admin_keyboard() -> InlineKeyboardMarkup:
 
 
 def register_admin_handlers(router: Router, runtime) -> None:
+    def groups_text() -> str:
+        rows = runtime.repository.groups()
+        if not rows:
+            return "🎓 Список групп пуст."
+        return "🎓 <b>Актуальные группы</b>\n" + "\n".join(
+            f"{row['number']} — {'активна' if row['is_active'] else 'отключена'}"
+            for row in rows
+        )
+
     @router.message(Command("admin"))
     async def admin(message: Message) -> None:
         if is_admin(message.from_user.id):
@@ -55,7 +65,7 @@ def register_admin_handlers(router: Router, runtime) -> None:
             await callback.message.edit_text(text, reply_markup=admin_keyboard())
         elif action == "users":
             rows, total = runtime.repository.users()
-            lines = [f"👥 <b>Пользователи ({total})</b>"] + [f"<code>{r['telegram_id']}</code> — {ROLES[r['role']]} — @{html.escape(r['username'] or 'без username')}" for r in rows]
+            lines = [f"👥 <b>Пользователи ({total})</b>"] + [f"<code>{r['telegram_id']}</code> — {ROLES[r['role']]}" + (f" — группа <b>{r['student_group']}</b>" if r['student_group'] else "") + f" — @{html.escape(r['username'] or 'без username')}" for r in rows]
             if total > len(rows):
                 lines.append(f"\nПоказаны первые {len(rows)}.")
             await callback.message.edit_text("\n".join(lines), reply_markup=admin_keyboard())
@@ -69,6 +79,9 @@ def register_admin_handlers(router: Router, runtime) -> None:
         elif action == "latest":
             lines = [f"{ROLES[a]}: {(runtime.repository.latest(a) or {'filename': 'нет'})['filename']}" for a in ("student", "teacher")]
             await callback.message.edit_text("📄 " + "\n".join(lines), reply_markup=admin_keyboard())
+        elif action == "groups":
+            runtime.admin_states[callback.from_user.id] = "groups"
+            await callback.message.edit_text(groups_text() + "\n\nКоманды:\n<code>add 451</code> — добавить\n<code>on 451</code> — сделать активной\n<code>off 451</code> — отключить\n<code>remove 451</code> — удалить\n<code>list</code> — обновить список\n/cancel — выйти", reply_markup=admin_keyboard())
 
     @router.message()
     async def admin_state(message: Message) -> None:
@@ -101,6 +114,26 @@ def register_admin_handlers(router: Router, runtime) -> None:
             removed = runtime.repository.remove(target_uid)
             runtime.admin_states.pop(uid, None)
             await message.answer("✅ Пользователь удалён." if removed else "Пользователь не найден.", reply_markup=admin_keyboard())
+        elif state == "groups":
+            parts = (message.text or "").strip().lower().split()
+            if parts == ["list"]:
+                await message.answer(groups_text(), reply_markup=admin_keyboard())
+                return
+            if len(parts) != 2 or parts[0] not in {"add", "on", "off", "remove"} or not parts[1].isdigit():
+                await message.answer("Формат: add 451, on 451, off 451, remove 451 или list.")
+                return
+            number = int(parts[1])
+            action_name = parts[0]
+            if action_name == "add":
+                runtime.repository.upsert_group(number, True)
+                response = f"✅ Группа {number} добавлена и активна."
+            elif action_name == "on":
+                response = f"✅ Группа {number} активирована." if runtime.repository.set_group_active(number, True) else f"Группа {number} не найдена. Сначала используйте add {number}."
+            elif action_name == "off":
+                response = f"✅ Группа {number} отключена." if runtime.repository.set_group_active(number, False) else f"Группа {number} не найдена."
+            else:
+                response = f"✅ Группа {number} отключена." if runtime.repository.remove_group(number) else f"Группа {number} не найдена."
+            await message.answer(response + "\n\n" + groups_text(), reply_markup=admin_keyboard())
         elif state == "broadcast_material":
             if message.text and message.text.lower() in AUDIENCES:
                 source = runtime.admin_broadcast_source.pop(uid, None)

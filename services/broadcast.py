@@ -70,6 +70,16 @@ async def worker(runtime) -> None:
         try:
             if row["kind"] == "copy":
                 await retry_send(state, lambda: runtime.bot.copy_message(chat_id=uid, from_chat_id=row["source_chat_id"], message_id=row["source_message_id"]))
+            elif row["kind"] == "student_group_pdf":
+                if row["student_schedule_mode"] == "full":
+                    schedule = runtime.repository.latest("student")
+                else:
+                    group_number = row["student_group"]
+                    schedule = runtime.repository.group_schedule(group_number) if group_number else None
+                if not schedule or not Path(schedule["path"]).is_file():
+                    raise FileNotFoundError(f"Student schedule is unavailable for user {uid}")
+                document = BufferedInputFile(Path(schedule["path"]).read_bytes(), filename=schedule["filename"])
+                await retry_send(state, lambda: runtime.bot.send_document(uid, document=document, caption=schedule["caption"] or None))
             else:
                 file_id = row["telegram_file_id"]
                 document = file_id or BufferedInputFile(Path(row["path"]).read_bytes(), filename=row["filename"])

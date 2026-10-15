@@ -15,3 +15,4 @@ class Runtime:
     admin_broadcast_source: dict[int, Any] = field(default_factory=dict)
     roll_waiting: set[int] = field(default_factory=set)
     reroll_options: dict[str, tuple[float, list[Any]]] = field(default_factory=dict)
+    group_waiting: set[int] = field(default_factory=set)
