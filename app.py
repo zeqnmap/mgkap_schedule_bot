@@ -10,7 +10,7 @@ from aiogram.enums import ParseMode
 from fastapi import FastAPI
 
 from api.internal import register_internal_api
-from config import BROADCAST_RETENTION_DAYS, DB_PATH, LEGACY_DB_PATH, LEGACY_DEFAULT_ROLE, TOKEN, logger
+from config import BROADCAST_RETENTION_DAYS, DB_PATH, TOKEN, logger
 from core.context import Runtime
 from handlers.admin import register_admin_handlers
 from handlers.commands import public_commands
@@ -20,9 +20,11 @@ from handlers.schedule import register_schedule_handlers
 from handlers.subscription import register_subscription_handlers
 from services.broadcast import worker
 from storage.repository import Repository
+from storage.migrations import require_current
 
 
 def build_runtime() -> Runtime:
+    require_current(DB_PATH)
     router = Router()
     runtime = Runtime(
         bot=Bot(TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML)),
@@ -44,10 +46,7 @@ def create_app(runtime: Runtime | None = None) -> FastAPI:
 
     @asynccontextmanager
     async def lifespan(_: FastAPI):
-        migrated = runtime.repository.migrate_legacy(LEGACY_DB_PATH, LEGACY_DEFAULT_ROLE)
         cleaned = runtime.repository.cleanup_completed_broadcasts(BROADCAST_RETENTION_DAYS)
-        if migrated:
-            logger.info("Imported %s subscribers from legacy database", migrated)
         if cleaned:
             logger.info("Removed %s expired broadcast jobs", cleaned)
         await runtime.bot.delete_webhook(drop_pending_updates=False)

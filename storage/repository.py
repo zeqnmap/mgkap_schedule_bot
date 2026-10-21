@@ -14,6 +14,7 @@ from typing import Any
 from aiogram.types import Message
 
 from config import ROLES, SCHEDULE_DIR as DEFAULT_SCHEDULE_DIR
+from .migrations import require_current
 
 
 def now() -> str:
@@ -25,7 +26,7 @@ class Repository:
         path.parent.mkdir(parents=True, exist_ok=True)
         self.path = path
         self.schedule_dir = DEFAULT_SCHEDULE_DIR
-        self._init_schema()
+        require_current(path)
 
     def _active_schedule_dir(self) -> Path:
         # Keep legacy tests and local integrations that override bot.SCHEDULE_DIR working.
@@ -38,52 +39,6 @@ class Repository:
         db.execute("PRAGMA journal_mode=WAL")
         db.execute("PRAGMA busy_timeout=30000")
         return db
-
-    def _init_schema(self) -> None:
-        with self.connect() as db:
-            db.executescript("""
-                CREATE TABLE IF NOT EXISTS subscribers (
-                    telegram_id INTEGER PRIMARY KEY,
-                    role TEXT NOT NULL CHECK(role IN ('student','teacher','applicant')),
-                    username TEXT, full_name TEXT NOT NULL DEFAULT '', student_group INTEGER,
-                    student_schedule_mode TEXT NOT NULL DEFAULT 'group' CHECK(student_schedule_mode IN ('group','full')),
-                    subscribed_at TEXT NOT NULL, updated_at TEXT NOT NULL
-                );
-                CREATE INDEX IF NOT EXISTS idx_subscribers_role ON subscribers(role);
-                CREATE TABLE IF NOT EXISTS schedule_groups (
-                    number INTEGER PRIMARY KEY, is_active INTEGER NOT NULL DEFAULT 1,
-                    updated_at TEXT NOT NULL
-                );
-                CREATE TABLE IF NOT EXISTS group_schedules (
-                    group_number INTEGER PRIMARY KEY, filename TEXT NOT NULL,
-                    caption TEXT NOT NULL DEFAULT '', path TEXT NOT NULL,
-                    content_hash TEXT NOT NULL, updated_at TEXT NOT NULL
-                );
-                CREATE TABLE IF NOT EXISTS settings (
-                    name TEXT PRIMARY KEY, value TEXT NOT NULL, updated_at TEXT NOT NULL
-                );
-                CREATE TABLE IF NOT EXISTS latest_schedules (
-                    audience TEXT PRIMARY KEY, filename TEXT NOT NULL,
-                    caption TEXT NOT NULL DEFAULT '', path TEXT NOT NULL,
-                    content_hash TEXT NOT NULL, telegram_file_id TEXT, updated_at TEXT NOT NULL
-                );
-                CREATE TABLE IF NOT EXISTS broadcast_jobs (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT, audience TEXT NOT NULL,
-                    kind TEXT NOT NULL, source_chat_id INTEGER, source_message_id INTEGER,
-                    path TEXT, filename TEXT, caption TEXT NOT NULL DEFAULT '', telegram_file_id TEXT,
-                    created_at TEXT NOT NULL, completed_at TEXT
-                );
-                CREATE TABLE IF NOT EXISTS broadcast_deliveries (
-                    job_id INTEGER NOT NULL, telegram_id INTEGER NOT NULL,
-                    status TEXT NOT NULL DEFAULT 'pending', attempts INTEGER NOT NULL DEFAULT 0,
-                    PRIMARY KEY(job_id,telegram_id)
-                );
-                CREATE INDEX IF NOT EXISTS idx_delivery_pending ON broadcast_deliveries(status,job_id);
-            """)
-            columns = {row[1] for row in db.execute("PRAGMA table_info(subscribers)")}
-            for name, definition in (("full_name", "TEXT NOT NULL DEFAULT ''"), ("student_group", "INTEGER"), ("student_schedule_mode", "TEXT NOT NULL DEFAULT 'group'"), ("subscribed_at", "TEXT NOT NULL DEFAULT ''"), ("updated_at", "TEXT NOT NULL DEFAULT ''")):
-                if name not in columns:
-                    db.execute(f"ALTER TABLE subscribers ADD COLUMN {name} {definition}")
 
     def migrate_legacy(self, path: str, default_role: str = "") -> int:
         if not path or not Path(path).is_file() or Path(path).resolve() == self.path.resolve():

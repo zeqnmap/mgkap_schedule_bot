@@ -11,17 +11,38 @@ os.environ.setdefault("BOT_TOKEN", "123:abc")
 os.environ.setdefault("BOT_SHARED_SECRET", "test-secret")
 os.environ.setdefault("BOT_DB_PATH", "/tmp/mgkap-import-test.db")
 
+from storage.migrations import backup, current_revision, require_current, upgrade, CURRENT_REVISION
+
+upgrade(Path(os.environ["BOT_DB_PATH"]))
+
 import bot
 
 
+def repository_for(path: Path):
+    upgrade(path)
+    return bot.Repository(path)
+
+
 class RepositoryTests(unittest.TestCase):
+    def test_bot_schema_revision_is_current_and_backup_is_restorable(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "bot.db"
+            upgrade(path)
+            self.assertEqual(current_revision(path), CURRENT_REVISION)
+            require_current(path)
+            saved = backup(path)
+            self.assertIsNotNone(saved)
+            with sqlite3.connect(saved) as db:
+                self.assertEqual(db.execute("PRAGMA integrity_check").fetchone()[0], "ok")
+                self.assertEqual(db.execute("SELECT version FROM schema_migrations").fetchone()[0], CURRENT_REVISION)
+
     def test_old_database_schema_is_upgraded_without_losing_users(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "bot.db"
             with sqlite3.connect(path) as db:
                 db.execute("CREATE TABLE subscribers(telegram_id INTEGER PRIMARY KEY, role TEXT NOT NULL, username TEXT, full_name TEXT, subscribed_at TEXT NOT NULL)")
                 db.execute("INSERT INTO subscribers VALUES(1,'student','old','Old','2026-09-01')")
-            repository = bot.Repository(path)
+            repository = repository_for(path)
             repository.set_role(SimpleNamespace(id=2, username="new", full_name="New"), "teacher")
             self.assertEqual(repository.stats(), {"student": 1, "teacher": 1, "applicant": 0, "total": 2})
 
@@ -31,7 +52,7 @@ class RepositoryTests(unittest.TestCase):
             with sqlite3.connect(legacy_path) as db:
                 db.execute("CREATE TABLE users(user_id INTEGER PRIMARY KEY, username TEXT, role TEXT)")
                 db.executemany("INSERT INTO users VALUES(?,?,?)", [(1, "one", "student"), (2, "two", "teacher"), (3, "three", None)])
-            repository = bot.Repository(Path(directory) / "bot.db")
+            repository = repository_for(Path(directory) / "bot.db")
             repository.migrate_legacy(str(legacy_path))
             repository.migrate_legacy(str(legacy_path))
             self.assertEqual(repository.stats()["total"], 2)
@@ -42,13 +63,25 @@ class RepositoryTests(unittest.TestCase):
             with sqlite3.connect(legacy_path) as db:
                 db.execute("CREATE TABLE users(user_id INTEGER PRIMARY KEY, username TEXT, role TEXT)")
                 db.executemany("INSERT INTO users VALUES(?,?,?)", [(1, "one", "student"), (2, "two", None)])
-            repository = bot.Repository(Path(directory) / "bot.db")
+            repository = repository_for(Path(directory) / "bot.db")
             repository.migrate_legacy(str(legacy_path), default_role="applicant")
             self.assertEqual(repository.stats(), {"student": 1, "teacher": 0, "applicant": 1, "total": 2})
 
+    def test_legacy_import_is_idempotent_and_reports_only_new_rows(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            legacy_path = root / "legacy.db"
+            with sqlite3.connect(legacy_path) as db:
+                db.execute("CREATE TABLE users(user_id INTEGER PRIMARY KEY, username TEXT, role TEXT)")
+                db.executemany("INSERT INTO users VALUES(?,?,?)", [(1, "one", "student"), (2, "two", "teacher")])
+            repository = repository_for(root / "bot.db")
+            self.assertEqual(repository.migrate_legacy(str(legacy_path)), 2)
+            self.assertEqual(repository.migrate_legacy(str(legacy_path)), 2)
+            self.assertEqual(repository.stats()["total"], 2)
+
     def test_completed_broadcast_history_is_pruned_after_retention_period(self):
         with tempfile.TemporaryDirectory() as directory:
-            repository = bot.Repository(Path(directory) / "bot.db")
+            repository = repository_for(Path(directory) / "bot.db")
             with repository.connect() as db:
                 db.execute(
                     "INSERT INTO broadcast_jobs(audience,kind,created_at,completed_at) VALUES(?,?,?,?)",
@@ -62,11 +95,46 @@ class RepositoryTests(unittest.TestCase):
 
     def test_subscriber_can_be_found_and_removed(self):
         with tempfile.TemporaryDirectory() as directory:
-            repository = bot.Repository(Path(directory) / "bot.db")
+            repository = repository_for(Path(directory) / "bot.db")
             repository.set_role(SimpleNamespace(id=42, username="user", full_name="User"), "student")
             self.assertEqual(repository.subscriber(42)["role"], "student")
             self.assertTrue(repository.remove(42))
             self.assertIsNone(repository.subscriber(42))
+
+    def test_group_specific_delivery_selects_group_or_full_pdf(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            old_schedule_dir = bot.SCHEDULE_DIR
+            bot.SCHEDULE_DIR = root / "schedules"
+            repository = repository_for(root / "bot.db")
+            try:
+                bot.repository = repository
+                repository.upsert_group(345)
+                repository.save_group_schedule(345, "345.pdf", "group", b"%PDF-group")
+                repository.save_schedule("student", "all.pdf", "all", b"%PDF-all")
+                for uid, group in ((1, 345), (2, 345)):
+                    repository.set_role(SimpleNamespace(id=uid, username=None, full_name="Student"), "student")
+                    repository.set_student_group(uid, group)
+                repository.set_student_schedule_mode(2, "full")
+                job_id = repository.enqueue_student_group_schedules()
+                rows = []
+                while row := repository.next_delivery():
+                    rows.append((row["telegram_id"], row["student_schedule_mode"]))
+                    repository.mark_delivery(row["job_id"], row["telegram_id"], "delivered")
+                self.assertEqual(rows, [(1, "group"), (2, "full")])
+                self.assertEqual(repository.job_stats(job_id)["delivered"], 2)
+            finally:
+                bot.SCHEDULE_DIR = old_schedule_dir
+
+    def test_unavailable_chat_is_removed_and_delivery_marked_removed(self):
+        with tempfile.TemporaryDirectory() as directory:
+            repository = repository_for(Path(directory) / "bot.db")
+            repository.set_role(SimpleNamespace(id=7, username=None, full_name="blocked"), "student")
+            job_id = repository.enqueue_copy("student", SimpleNamespace(chat=SimpleNamespace(id=3), message_id=4))
+            self.assertTrue(repository.remove(7))
+            repository.mark_delivery(job_id, 7, "removed")
+            self.assertEqual(repository.job_stats(job_id)["removed"], 1)
+            self.assertEqual(repository.job_stats(job_id)["pending"], 0)
 
 
 class BroadcastTests(unittest.IsolatedAsyncioTestCase):
@@ -75,7 +143,7 @@ class BroadcastTests(unittest.IsolatedAsyncioTestCase):
             old_repository = bot.repository
             old_schedule_dir = bot.SCHEDULE_DIR
             old_rate = bot.SEND_RATE
-            bot.repository = bot.Repository(Path(directory) / "bot.db")
+            bot.repository = repository_for(Path(directory) / "bot.db")
             bot.SCHEDULE_DIR = Path(directory) / "schedules"
             bot.SEND_RATE = 1000
             try:
@@ -113,7 +181,7 @@ class BroadcastTests(unittest.IsolatedAsyncioTestCase):
         with tempfile.TemporaryDirectory() as directory:
             old_repository = bot.repository
             old_rate = bot.SEND_RATE
-            bot.repository = bot.Repository(Path(directory) / "bot.db")
+            bot.repository = repository_for(Path(directory) / "bot.db")
             bot.SEND_RATE = 1000
             try:
                 for uid, role in ((1, "student"), (2, "teacher")):
@@ -147,7 +215,7 @@ class BroadcastTests(unittest.IsolatedAsyncioTestCase):
         with tempfile.TemporaryDirectory() as directory:
             old_schedule_dir = bot.SCHEDULE_DIR
             bot.SCHEDULE_DIR = Path(directory) / "schedules"
-            repository = bot.Repository(Path(directory) / "bot.db")
+            repository = repository_for(Path(directory) / "bot.db")
             try:
                 repository.set_role(SimpleNamespace(id=1, username=None, full_name="Test"), "student")
                 job_id = repository.enqueue_pdf("student", "Расписание.pdf", "", b"%PDF-1.4\n")
