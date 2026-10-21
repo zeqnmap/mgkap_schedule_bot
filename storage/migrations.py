@@ -6,7 +6,7 @@ import sqlite3
 from datetime import datetime, timezone
 from pathlib import Path
 
-CURRENT_REVISION = "0001_bot_schema"
+CURRENT_REVISION = "0003_pinned_student_deliveries"
 
 
 def connect(path: Path) -> sqlite3.Connection:
@@ -66,9 +66,20 @@ def _upgrade_schema(path: Path) -> None:
                 path TEXT, filename TEXT, caption TEXT NOT NULL DEFAULT '', telegram_file_id TEXT,
                 created_at TEXT NOT NULL, completed_at TEXT
             );
+            CREATE TABLE IF NOT EXISTS publication_versions (
+                id TEXT PRIMARY KEY, audience TEXT NOT NULL, caption TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS publication_files (
+                publication_id TEXT NOT NULL, audience TEXT NOT NULL,
+                group_number INTEGER, filename TEXT NOT NULL, caption TEXT NOT NULL,
+                path TEXT NOT NULL, content_hash TEXT NOT NULL,
+                PRIMARY KEY(publication_id, audience, group_number)
+            );
             CREATE TABLE IF NOT EXISTS broadcast_deliveries (
                 job_id INTEGER NOT NULL, telegram_id INTEGER NOT NULL,
                 status TEXT NOT NULL DEFAULT 'pending', attempts INTEGER NOT NULL DEFAULT 0,
+                student_group INTEGER, student_schedule_mode TEXT,
                 PRIMARY KEY(job_id,telegram_id)
             );
             CREATE INDEX IF NOT EXISTS idx_delivery_pending ON broadcast_deliveries(status,job_id);
@@ -87,6 +98,13 @@ def _upgrade_schema(path: Path) -> None:
         ):
             if name not in columns:
                 db.execute(f"ALTER TABLE subscribers ADD COLUMN {name} {definition}")
+        job_columns = {row[1] for row in db.execute("PRAGMA table_info(broadcast_jobs)")}
+        if "publication_id" not in job_columns:
+            db.execute("ALTER TABLE broadcast_jobs ADD COLUMN publication_id TEXT")
+        delivery_columns = {row[1] for row in db.execute("PRAGMA table_info(broadcast_deliveries)")}
+        for name, definition in (("student_group", "INTEGER"), ("student_schedule_mode", "TEXT")):
+            if name not in delivery_columns:
+                db.execute(f"ALTER TABLE broadcast_deliveries ADD COLUMN {name} {definition}")
         db.execute(
             "INSERT OR IGNORE INTO schema_migrations(version) VALUES (?)",
             (CURRENT_REVISION,),

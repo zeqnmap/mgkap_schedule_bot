@@ -71,11 +71,13 @@ async def worker(runtime) -> None:
             if row["kind"] == "copy":
                 await retry_send(state, lambda: runtime.bot.copy_message(chat_id=uid, from_chat_id=row["source_chat_id"], message_id=row["source_message_id"]))
             elif row["kind"] == "student_group_pdf":
-                if row["student_schedule_mode"] == "full":
-                    schedule = runtime.repository.latest("student")
+                delivery_mode = row["delivery_student_schedule_mode"] or row["student_schedule_mode"]
+                delivery_group = row["delivery_student_group"] if row["delivery_student_group"] is not None else row["student_group"]
+                if delivery_mode == "full":
+                    schedule = runtime.repository.publication_schedule(row["publication_id"], "student") if row["publication_id"] else runtime.repository.latest("student")
                 else:
-                    group_number = row["student_group"]
-                    schedule = runtime.repository.group_schedule(group_number) if group_number else None
+                    group_number = delivery_group
+                    schedule = runtime.repository.publication_schedule(row["publication_id"], "student_group", group_number) if row["publication_id"] and group_number else (runtime.repository.group_schedule(group_number) if group_number else None)
                 if not schedule or not Path(schedule["path"]).is_file():
                     raise FileNotFoundError(f"Student schedule is unavailable for user {uid}")
                 document = BufferedInputFile(Path(schedule["path"]).read_bytes(), filename=schedule["filename"])

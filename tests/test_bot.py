@@ -126,6 +126,32 @@ class RepositoryTests(unittest.TestCase):
             finally:
                 bot.SCHEDULE_DIR = old_schedule_dir
 
+    def test_student_publication_pins_the_delivery_version_without_changing_groups(self):
+        with tempfile.TemporaryDirectory() as directory:
+            old_schedule_dir = bot.SCHEDULE_DIR
+            bot.SCHEDULE_DIR = Path(directory) / "schedules"
+            try:
+                repository = repository_for(Path(directory) / "bot.db")
+                repository.upsert_group(345)
+                repository.set_role(SimpleNamespace(id=1, username=None, full_name="Student"), "student")
+                repository.set_student_group(1, 345)
+                publication, publication_job_id = repository.publish_student_package(
+                    "all.pdf", "week", b"%PDF-all",
+                    {345: ("345.pdf", b"%PDF-345"), 346: ("346.pdf", b"%PDF-346")}, [345, 346],
+                )
+                self.assertEqual([row["number"] for row in repository.groups(active_only=True)], [345])
+                self.assertEqual(repository.job_stats(publication_job_id)["pending"], 1)
+                delivery = repository.next_delivery()
+                self.assertEqual(delivery["job_id"], publication_job_id)
+                repository.mark_delivery(publication_job_id, 1, "delivered")
+                job_id = repository.enqueue_student_group_schedules(publication)
+                delivery = repository.next_delivery()
+                self.assertEqual(delivery["job_id"], job_id)
+                self.assertEqual(delivery["publication_id"], publication)
+                self.assertEqual(repository.publication_schedule(publication, "student_group", 345)["path"], repository.group_schedule(345)["path"])
+            finally:
+                bot.SCHEDULE_DIR = old_schedule_dir
+
     def test_unavailable_chat_is_removed_and_delivery_marked_removed(self):
         with tempfile.TemporaryDirectory() as directory:
             repository = repository_for(Path(directory) / "bot.db")

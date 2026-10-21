@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import os
+import io
+import json
 import tempfile
 import unittest
+import zipfile
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -104,6 +107,21 @@ class InternalApiTests(unittest.TestCase):
     def test_broadcast_status_is_protected(self):
         response = self.client.get("/internal/broadcast/1")
         self.assertEqual(response.status_code, 401)
+
+    def test_student_package_publishes_all_groups_without_changing_selection(self):
+        archive = io.BytesIO()
+        with zipfile.ZipFile(archive, "w") as package:
+            package.writestr("manifest.json", json.dumps({"filename": "all.pdf", "caption": "week", "groups": [345, 346]}))
+            package.writestr("student.pdf", b"%PDF-all")
+            package.writestr("groups/345.pdf", b"%PDF-345")
+            package.writestr("groups/346.pdf", b"%PDF-346")
+        response = self.client.post("/internal/publish-student-package", headers=self.headers, content=archive.getvalue())
+        self.assertEqual(response.status_code, 200, response.text)
+        publication_id = response.json()["publication_id"]
+        self.assertIn("job_id", response.json())
+        self.assertEqual(response.json()["queued"], response.json()["pending"])
+        self.assertFalse(self.repository.group_exists(345))
+        self.assertEqual(Path(self.repository.publication_schedule(publication_id, "student_group", 346)["path"]).read_bytes(), b"%PDF-346")
 
 
 if __name__ == "__main__":

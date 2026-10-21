@@ -7,6 +7,7 @@ import os
 import re
 import sqlite3
 import sys
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -180,6 +181,104 @@ class Repository:
         with self.connect() as db:
             return db.execute("SELECT * FROM group_schedules WHERE group_number=?", (group_number,)).fetchone()
 
+    def publish_student_package(self, filename: str, caption: str, full_pdf: bytes,
+                                group_pdfs: dict[int, tuple[str, bytes]], group_numbers: list[int]) -> tuple[str, int]:
+        """Install a complete student publication without touching the active one mid-upload."""
+        expected = {int(number) for number in group_numbers}
+        if not expected or any(number < 1 for number in expected) or set(group_pdfs) != expected:
+            raise ValueError("Publication must include every active group exactly once")
+        if not full_pdf.startswith(b"%PDF") or any(not content.startswith(b"%PDF") for _, content in group_pdfs.values()):
+            raise ValueError("Publication contains an invalid PDF")
+        publication_id = uuid.uuid4().hex
+        schedule_dir = self._active_schedule_dir()
+        version_dir = schedule_dir / "publications" / publication_id
+        version_dir.mkdir(parents=True, exist_ok=False)
+        safe_full = re.sub(r"[^\w.() -]", "_", Path(filename).name, flags=re.UNICODE)[:120] or "Расписание.pdf"
+        full_path = version_dir / safe_full
+        full_path.write_bytes(full_pdf)
+        file_rows = [("student", None, safe_full, str(full_path), hashlib.sha256(full_pdf).hexdigest())]
+        for number in sorted(expected):
+            source_name, content = group_pdfs[number]
+            safe = re.sub(r"[^\w.() -]", "_", Path(source_name).name, flags=re.UNICODE)[:120] or f"Группа_{number}.pdf"
+            path = version_dir / f"group_{number}_{safe}"
+            path.write_bytes(content)
+            file_rows.append(("student_group", number, safe, str(path), hashlib.sha256(content).hexdigest()))
+        try:
+            with self.connect() as db:
+                timestamp = now()
+                db.execute("INSERT INTO publication_versions(id,audience,caption,created_at) VALUES(?,?,?,?)", (publication_id, "student", caption, timestamp))
+                db.executemany("INSERT INTO publication_files(publication_id,audience,group_number,filename,caption,path,content_hash) VALUES(?,?,?,?,?,?,?)", [(publication_id, audience, group_number, file_name, caption, path, digest) for audience, group_number, file_name, path, digest in file_rows])
+                db.execute("""INSERT INTO latest_schedules VALUES(?,?,?,?,?,?,?)
+                    ON CONFLICT(audience) DO UPDATE SET filename=excluded.filename,caption=excluded.caption,path=excluded.path,content_hash=excluded.content_hash,telegram_file_id=NULL,updated_at=excluded.updated_at""", ("student", safe_full, caption, str(full_path), hashlib.sha256(full_pdf).hexdigest(), None, timestamp))
+                db.executemany("""INSERT INTO group_schedules VALUES(?,?,?,?,?,?)
+                    ON CONFLICT(group_number) DO UPDATE SET filename=excluded.filename,caption=excluded.caption,path=excluded.path,content_hash=excluded.content_hash,updated_at=excluded.updated_at""", [(number, file_name, caption, path, digest, timestamp) for _, number, file_name, path, digest in file_rows if number is not None])
+                cursor = db.execute(
+                    "INSERT INTO broadcast_jobs(audience,kind,caption,publication_id,created_at) VALUES(?,?,?,?,?)",
+                    ("student", "student_group_pdf", caption, publication_id, timestamp),
+                )
+                job_id = int(cursor.lastrowid)
+                recipients = db.execute("""
+                    SELECT s.telegram_id,s.student_group,s.student_schedule_mode
+                    FROM subscribers s
+                    LEFT JOIN schedule_groups g ON g.number=s.student_group AND g.is_active=1
+                    WHERE s.role='student' AND (
+                        s.student_schedule_mode='full'
+                        OR (s.student_schedule_mode='group' AND s.student_group IS NOT NULL AND g.number IS NOT NULL
+                            AND EXISTS (
+                                SELECT 1 FROM publication_files pf
+                                WHERE pf.publication_id=? AND pf.audience='student_group'
+                                  AND pf.group_number=s.student_group
+                            ))
+                    )
+                """, (publication_id,)).fetchall()
+                db.executemany(
+                    "INSERT INTO broadcast_deliveries(job_id,telegram_id,student_group,student_schedule_mode) VALUES(?,?,?,?)",
+                    [(job_id, int(row["telegram_id"]), row["student_group"], row["student_schedule_mode"]) for row in recipients],
+                )
+                if not recipients:
+                    db.execute("UPDATE broadcast_jobs SET completed_at=? WHERE id=?", (timestamp, job_id))
+        except Exception:
+            for path in version_dir.iterdir():
+                path.unlink(missing_ok=True)
+            version_dir.rmdir()
+            raise
+        return publication_id, job_id
+
+    def publication_schedule(self, publication_id: str, audience: str, group_number: int | None = None) -> sqlite3.Row | None:
+        with self.connect() as db:
+            return db.execute("SELECT filename,caption,path,content_hash FROM publication_files WHERE publication_id=? AND audience=? AND group_number IS ?", (publication_id, audience, group_number)).fetchone()
+
+    def publish_single_schedule(self, audience: str, filename: str, caption: str, content: bytes) -> int:
+        if audience not in {"student", "teacher"} or not content.startswith(b"%PDF"):
+            raise ValueError("Invalid audience or PDF")
+        publication_id = uuid.uuid4().hex
+        schedule_dir = self._active_schedule_dir()
+        version_dir = schedule_dir / "publications" / publication_id
+        version_dir.mkdir(parents=True, exist_ok=False)
+        safe = re.sub(r"[^\w.() -]", "_", Path(filename).name, flags=re.UNICODE)[:120] or "Расписание.pdf"
+        path = version_dir / safe
+        path.write_bytes(content)
+        digest = hashlib.sha256(content).hexdigest()
+        try:
+            with self.connect() as db:
+                timestamp = now()
+                db.execute("INSERT INTO publication_versions(id,audience,caption,created_at) VALUES(?,?,?,?)", (publication_id, audience, caption, timestamp))
+                db.execute("INSERT INTO publication_files(publication_id,audience,group_number,filename,caption,path,content_hash) VALUES(?,?,?,?,?,?,?)", (publication_id, audience, None, safe, caption, str(path), digest))
+                db.execute("""INSERT INTO latest_schedules VALUES(?,?,?,?,?,?,?)
+                    ON CONFLICT(audience) DO UPDATE SET filename=excluded.filename,caption=excluded.caption,path=excluded.path,content_hash=excluded.content_hash,telegram_file_id=NULL,updated_at=excluded.updated_at""", (audience, safe, caption, str(path), digest, None, timestamp))
+                cursor = db.execute("INSERT INTO broadcast_jobs(audience,kind,path,filename,caption,publication_id,created_at) VALUES(?,?,?,?,?,?,?)", (audience, "pdf", str(path), safe, caption, publication_id, timestamp))
+                job_id = int(cursor.lastrowid)
+                recipients = db.execute("SELECT telegram_id FROM subscribers WHERE role=?", (audience,)).fetchall()
+                db.executemany("INSERT INTO broadcast_deliveries(job_id,telegram_id) VALUES(?,?)", [(job_id, int(row[0])) for row in recipients])
+                if not recipients:
+                    db.execute("UPDATE broadcast_jobs SET completed_at=? WHERE id=?", (timestamp, job_id))
+                return job_id
+        except Exception:
+            for item in version_dir.iterdir():
+                item.unlink(missing_ok=True)
+            version_dir.rmdir()
+            raise
+
     def latest(self, audience: str) -> sqlite3.Row | None:
         with self.connect() as db:
             row = db.execute("SELECT * FROM latest_schedules WHERE audience=?", (audience,)).fetchone()
@@ -220,16 +319,16 @@ class Repository:
                 db.execute("UPDATE broadcast_jobs SET completed_at=? WHERE id=?", (now(), job_id))
             return job_id
 
-    def enqueue_student_group_schedules(self) -> int:
+    def enqueue_student_group_schedules(self, publication_id: str | None = None) -> int:
         """Queue one group-specific PDF for every student with a valid selected group."""
         with self.connect() as db:
             cursor = db.execute(
-                "INSERT INTO broadcast_jobs(audience,kind,caption,created_at) VALUES(?,?,?,?)",
-                ("student", "student_group_pdf", "", now()),
+                "INSERT INTO broadcast_jobs(audience,kind,caption,publication_id,created_at) VALUES(?,?,?,?,?)",
+                ("student", "student_group_pdf", "", publication_id, now()),
             )
             job_id = int(cursor.lastrowid)
             recipients = db.execute("""
-                SELECT s.telegram_id
+                SELECT s.telegram_id,s.student_group,s.student_schedule_mode
                 FROM subscribers s
                 LEFT JOIN schedule_groups g ON g.number=s.student_group AND g.is_active=1
                 LEFT JOIN group_schedules pdf ON pdf.group_number=s.student_group
@@ -239,8 +338,8 @@ class Repository:
                 )
             """).fetchall()
             db.executemany(
-                "INSERT INTO broadcast_deliveries(job_id,telegram_id) VALUES(?,?)",
-                [(job_id, int(row[0])) for row in recipients],
+                "INSERT INTO broadcast_deliveries(job_id,telegram_id,student_group,student_schedule_mode) VALUES(?,?,?,?)",
+                [(job_id, int(row["telegram_id"]), row["student_group"], row["student_schedule_mode"]) for row in recipients],
             )
             if not recipients:
                 db.execute("UPDATE broadcast_jobs SET completed_at=? WHERE id=?", (now(), job_id))
@@ -257,8 +356,9 @@ class Repository:
 
     def next_delivery(self) -> sqlite3.Row | None:
         with self.connect() as db:
-            return db.execute("""SELECT d.job_id,d.telegram_id,d.attempts,j.audience,j.kind,j.path,j.filename,j.caption,
-                j.source_chat_id,j.source_message_id,j.telegram_file_id,s.student_group,s.student_schedule_mode FROM broadcast_deliveries d
+            return db.execute("""SELECT d.job_id,d.telegram_id,d.attempts,d.student_group AS delivery_student_group,
+                d.student_schedule_mode AS delivery_student_schedule_mode,j.audience,j.kind,j.path,j.filename,j.caption,
+                j.source_chat_id,j.source_message_id,j.telegram_file_id,j.publication_id,s.student_group,s.student_schedule_mode FROM broadcast_deliveries d
                 JOIN broadcast_jobs j ON j.id=d.job_id
                 LEFT JOIN subscribers s ON s.telegram_id=d.telegram_id
                 WHERE d.status='pending'

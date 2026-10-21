@@ -5,6 +5,9 @@ services:
     env_file: .env
     volumes:
       - ./bot.db:/app/bot.db
+      # SQLite WAL mode uses sidecar files; persist them with the database.
+      - ./bot.db-wal:/app/bot.db-wal
+      - ./bot.db-shm:/app/bot.db-shm
       - ./schedules:/app/schedules
     ports:
       - "127.0.0.1:8081:8081"
