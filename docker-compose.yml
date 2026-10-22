@@ -4,10 +4,8 @@ services:
     container_name: mgkap_schedule_bot
     env_file: .env
     volumes:
-      - ./bot.db:/app/bot.db
-      # SQLite WAL mode uses sidecar files; persist them with the database.
-      - ./bot.db-wal:/app/bot.db-wal
-      - ./bot.db-shm:/app/bot.db-shm
+      # Keep the SQLite database and its WAL sidecars in one durable directory.
+      - ./data:/data
       - ./schedules:/app/schedules
     ports:
       - "127.0.0.1:8081:8081"
