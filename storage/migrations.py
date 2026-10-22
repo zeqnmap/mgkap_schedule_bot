@@ -3,18 +3,28 @@
 from __future__ import annotations
 
 import sqlite3
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Iterator
 
 CURRENT_REVISION = "0003_pinned_student_deliveries"
 
 
-def connect(path: Path) -> sqlite3.Connection:
+@contextmanager
+def connect(path: Path) -> Iterator[sqlite3.Connection]:
     path.parent.mkdir(parents=True, exist_ok=True)
     db = sqlite3.connect(path, timeout=30)
     db.row_factory = sqlite3.Row
     db.execute("PRAGMA busy_timeout=30000")
-    return db
+    try:
+        yield db
+        db.commit()
+    except Exception:
+        db.rollback()
+        raise
+    finally:
+        db.close()
 
 
 def current_revision(path: Path) -> str | None:
@@ -117,27 +127,31 @@ def import_legacy(path: Path, target: Path, default_role: str = "") -> int:
         return 0
     allowed = {"student", "teacher", "applicant"}
     default_role = default_role if default_role in allowed else ""
-    with sqlite3.connect(path) as legacy, connect(target) as db:
-        columns = {row[1] for row in legacy.execute("PRAGMA table_info(users)")}
-        if "user_id" not in columns:
-            return 0
-        username = "username" if "username" in columns else "''"
-        role = "role" if "role" in columns else "NULL"
-        rows = legacy.execute(f"SELECT user_id,{username},{role} FROM users").fetchall()
-        timestamp = datetime.now(timezone.utc).isoformat()
-        imported = 0
-        for uid, name, selected_role in rows:
-            target_role = selected_role if selected_role in allowed else default_role
-            if not target_role:
-                continue
-            cursor = db.execute(
-                "INSERT OR IGNORE INTO subscribers "
-                "(telegram_id,role,username,full_name,student_group,subscribed_at,updated_at) "
-                "VALUES(?,?,?,?,?,?,?)",
-                (uid, target_role, name, name or "", None, timestamp, timestamp),
-            )
-            imported += cursor.rowcount
-        return imported
+    legacy = sqlite3.connect(path)
+    try:
+        with connect(target) as db:
+            columns = {row[1] for row in legacy.execute("PRAGMA table_info(users)")}
+            if "user_id" not in columns:
+                return 0
+            username = "username" if "username" in columns else "''"
+            role = "role" if "role" in columns else "NULL"
+            rows = legacy.execute(f"SELECT user_id,{username},{role} FROM users").fetchall()
+            timestamp = datetime.now(timezone.utc).isoformat()
+            imported = 0
+            for uid, name, selected_role in rows:
+                target_role = selected_role if selected_role in allowed else default_role
+                if not target_role:
+                    continue
+                cursor = db.execute(
+                    "INSERT OR IGNORE INTO subscribers "
+                    "(telegram_id,role,username,full_name,student_group,subscribed_at,updated_at) "
+                    "VALUES(?,?,?,?,?,?,?)",
+                    (uid, target_role, name, name or "", None, timestamp, timestamp),
+                )
+                imported += cursor.rowcount
+            return imported
+    finally:
+        legacy.close()
 
 
 def backup(path: Path) -> Path | None:
@@ -145,8 +159,14 @@ def backup(path: Path) -> Path | None:
         return None
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     destination = path.with_name(f"{path.name}.pre-migration-{stamp}.bak")
-    with sqlite3.connect(path) as source, sqlite3.connect(destination) as target:
+    source = sqlite3.connect(path)
+    target = sqlite3.connect(destination)
+    try:
         source.backup(target)
+        target.commit()
+    finally:
+        source.close()
+        target.close()
     return destination
 
 

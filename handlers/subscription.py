@@ -103,6 +103,15 @@ def register_subscription_handlers(router: Router, runtime) -> None:
         await callback.message.edit_text("Напишите номер новой группы.")
         await callback.answer("Введите новую группу")
 
+    @router.callback_query(F.data == "subscription:done")
+    async def finish_subscription(callback: CallbackQuery) -> None:
+        """Close the settings keyboard while keeping the confirmation message visible."""
+        if not callback.message:
+            await callback.answer()
+            return
+        await callback.message.edit_reply_markup(reply_markup=None)
+        await callback.answer("Готово")
+
     @router.message(lambda message: message.from_user.id in runtime.group_waiting)
     async def student_group(message: Message) -> None:
         uid = message.from_user.id

@@ -3,6 +3,7 @@ import os
 import sqlite3
 import tempfile
 import unittest
+from contextlib import closing
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
@@ -32,16 +33,17 @@ class RepositoryTests(unittest.TestCase):
             require_current(path)
             saved = backup(path)
             self.assertIsNotNone(saved)
-            with sqlite3.connect(saved) as db:
+            with closing(sqlite3.connect(saved)) as db:
                 self.assertEqual(db.execute("PRAGMA integrity_check").fetchone()[0], "ok")
                 self.assertEqual(db.execute("SELECT version FROM schema_migrations").fetchone()[0], CURRENT_REVISION)
 
     def test_old_database_schema_is_upgraded_without_losing_users(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "bot.db"
-            with sqlite3.connect(path) as db:
+            with closing(sqlite3.connect(path)) as db:
                 db.execute("CREATE TABLE subscribers(telegram_id INTEGER PRIMARY KEY, role TEXT NOT NULL, username TEXT, full_name TEXT, subscribed_at TEXT NOT NULL)")
                 db.execute("INSERT INTO subscribers VALUES(1,'student','old','Old','2026-09-01')")
+                db.commit()
             repository = repository_for(path)
             repository.set_role(SimpleNamespace(id=2, username="new", full_name="New"), "teacher")
             self.assertEqual(repository.stats(), {"student": 1, "teacher": 1, "applicant": 0, "total": 2})
@@ -49,9 +51,10 @@ class RepositoryTests(unittest.TestCase):
     def test_legacy_import_keeps_only_selected_roles(self):
         with tempfile.TemporaryDirectory() as directory:
             legacy_path = Path(directory) / "legacy.db"
-            with sqlite3.connect(legacy_path) as db:
+            with closing(sqlite3.connect(legacy_path)) as db:
                 db.execute("CREATE TABLE users(user_id INTEGER PRIMARY KEY, username TEXT, role TEXT)")
                 db.executemany("INSERT INTO users VALUES(?,?,?)", [(1, "one", "student"), (2, "two", "teacher"), (3, "three", None)])
+                db.commit()
             repository = repository_for(Path(directory) / "bot.db")
             repository.migrate_legacy(str(legacy_path))
             repository.migrate_legacy(str(legacy_path))
@@ -60,9 +63,10 @@ class RepositoryTests(unittest.TestCase):
     def test_legacy_import_can_keep_users_without_role_as_applicants(self):
         with tempfile.TemporaryDirectory() as directory:
             legacy_path = Path(directory) / "legacy.db"
-            with sqlite3.connect(legacy_path) as db:
+            with closing(sqlite3.connect(legacy_path)) as db:
                 db.execute("CREATE TABLE users(user_id INTEGER PRIMARY KEY, username TEXT, role TEXT)")
                 db.executemany("INSERT INTO users VALUES(?,?,?)", [(1, "one", "student"), (2, "two", None)])
+                db.commit()
             repository = repository_for(Path(directory) / "bot.db")
             repository.migrate_legacy(str(legacy_path), default_role="applicant")
             self.assertEqual(repository.stats(), {"student": 1, "teacher": 0, "applicant": 1, "total": 2})
@@ -71,9 +75,10 @@ class RepositoryTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             legacy_path = root / "legacy.db"
-            with sqlite3.connect(legacy_path) as db:
+            with closing(sqlite3.connect(legacy_path)) as db:
                 db.execute("CREATE TABLE users(user_id INTEGER PRIMARY KEY, username TEXT, role TEXT)")
                 db.executemany("INSERT INTO users VALUES(?,?,?)", [(1, "one", "student"), (2, "two", "teacher")])
+                db.commit()
             repository = repository_for(root / "bot.db")
             self.assertEqual(repository.migrate_legacy(str(legacy_path)), 2)
             self.assertEqual(repository.migrate_legacy(str(legacy_path)), 2)

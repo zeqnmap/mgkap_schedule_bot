@@ -12,6 +12,7 @@ def schedule_mode_keyboard(mode: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text=text, callback_data="schedule:toggle-mode")],
         [InlineKeyboardButton(text="✏️ Изменить свою группу", callback_data="subscription:change-group")],
+        [InlineKeyboardButton(text="✅ Готово", callback_data="subscription:done")],
     ])
 
 

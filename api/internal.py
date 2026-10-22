@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hmac
+import hashlib
 import io
 import json
 import zipfile
@@ -8,6 +9,7 @@ import zipfile
 from fastapi import APIRouter, Header, HTTPException, Request
 
 from config import SHARED_SECRET
+from .contracts import PublicationManifest
 
 
 def register_internal_api(runtime) -> APIRouter:
@@ -74,14 +76,22 @@ def register_internal_api(runtime) -> APIRouter:
             raise HTTPException(status_code=413, detail="Publication package is missing or too large")
         try:
             with zipfile.ZipFile(io.BytesIO(content)) as package:
-                manifest = json.loads(package.read("manifest.json"))
-                group_numbers = [int(number) for number in manifest["groups"]]
+                manifest = PublicationManifest.model_validate(json.loads(package.read("manifest.json")))
+                group_numbers = [int(number) for number in manifest.groups]
                 if not group_numbers or len(group_numbers) != len(set(group_numbers)) or any(number < 1 for number in group_numbers):
                     raise ValueError("Publication groups must be unique positive numbers")
-                filename = str(manifest.get("filename") or "Расписание.pdf")
-                caption = str(manifest.get("caption") or "")
+                filename = manifest.filename
+                caption = manifest.caption
                 full_pdf = package.read("student.pdf")
                 group_pdfs = {number: (f"Расписание группы {number}.pdf", package.read(f"groups/{number}.pdf")) for number in group_numbers}
+                if manifest.files:
+                    expected = {item.group_number: item.sha256 for item in manifest.files if item.group_number is not None}
+                    full_hash = next((item.sha256 for item in manifest.files if item.group_number is None), None)
+                    if full_hash and hashlib.sha256(full_pdf).hexdigest() != full_hash:
+                        raise ValueError("Full publication hash does not match manifest")
+                    for number, (_, content) in group_pdfs.items():
+                        if expected.get(number) != hashlib.sha256(content).hexdigest():
+                            raise ValueError(f"Group {number} hash does not match manifest")
         except (KeyError, TypeError, ValueError, zipfile.BadZipFile, json.JSONDecodeError) as exc:
             raise HTTPException(status_code=400, detail="Invalid publication package") from exc
         try:

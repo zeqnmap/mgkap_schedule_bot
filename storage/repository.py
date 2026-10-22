@@ -8,9 +8,10 @@ import re
 import sqlite3
 import sys
 import uuid
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
 
 from aiogram.types import Message
 
@@ -34,12 +35,20 @@ class Repository:
         runtime = sys.modules.get("bot")
         return getattr(runtime, "SCHEDULE_DIR", self.schedule_dir) if runtime else self.schedule_dir
 
-    def connect(self) -> sqlite3.Connection:
+    @contextmanager
+    def connect(self) -> Iterator[sqlite3.Connection]:
         db = sqlite3.connect(self.path, timeout=30)
         db.row_factory = sqlite3.Row
         db.execute("PRAGMA journal_mode=WAL")
         db.execute("PRAGMA busy_timeout=30000")
-        return db
+        try:
+            yield db
+            db.commit()
+        except Exception:
+            db.rollback()
+            raise
+        finally:
+            db.close()
 
     def migrate_legacy(self, path: str, default_role: str = "") -> int:
         if not path or not Path(path).is_file() or Path(path).resolve() == self.path.resolve():
